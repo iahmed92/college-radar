@@ -130,21 +130,39 @@ def discover_emerging_artists(token: str, max_popularity: int, target: int) -> l
 
 # ── BANDSINTOWN ───────────────────────────────────────────────────────────────
 
-def get_show_cities(artist_name: str, date_filter: str, cache: dict) -> set[str]:
-    """Return set of cities where artist has shows. Cached per artist + date_filter."""
-    key = f"{artist_name}::{date_filter}"
-    if key not in cache:
-        try:
-            run = client.actor("solidcode/bandsintown-scraper").call(
-                run_input={"artists": [artist_name], "queryType": "events", "dateFilter": date_filter}
-            )
-            cache[key] = {
-                event.get("venueCity", "")
-                for event in client.dataset(run.default_dataset_id).iterate_items()
-            }
-        except Exception:
-            cache[key] = set()
-    return cache[key]
+BATCH_SIZE = 15  # artists per Bandsintown actor call
+
+
+def batch_get_show_cities(artist_names: list[str], date_filter: str) -> dict[str, set[str]]:
+    """
+    Fetch show cities for up to BATCH_SIZE artists in a single Bandsintown actor call.
+    Returns {artist_name: {city, ...}}.
+    """
+    result: dict[str, set[str]] = {name: set() for name in artist_names}
+    try:
+        run = client.actor("solidcode/bandsintown-scraper").call(
+            run_input={"artists": artist_names, "queryType": "events", "dateFilter": date_filter}
+        )
+        for event in client.dataset(run.default_dataset_id).iterate_items():
+            name = event.get("artistName", "")
+            city = event.get("venueCity", "")
+            if name in result and city:
+                result[name].add(city)
+    except Exception:
+        pass
+    return result
+
+
+def prefetch_show_cities(artist_names: list[str], date_filter: str, label: str) -> dict[str, set[str]]:
+    """Batch-fetch show cities for all artists with a live progress indicator."""
+    combined: dict[str, set[str]] = {}
+    batches = [artist_names[i:i+BATCH_SIZE] for i in range(0, len(artist_names), BATCH_SIZE)]
+    bar = st.progress(0, text=f"{label} (batch 1/{len(batches)})...")
+    for idx, batch in enumerate(batches):
+        bar.progress(int((idx / len(batches)) * 100), text=f"{label} (batch {idx+1}/{len(batches)})...")
+        combined.update(batch_get_show_cities(batch, date_filter))
+    bar.progress(100, text=f"{label} — done.")
+    return combined
 
 
 # ── PERSISTENCE ───────────────────────────────────────────────────────────────
@@ -251,7 +269,7 @@ with tab_run:
                 st.error("Spotify authentication failed — check SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in secrets.")
                 st.stop()
 
-            # Step 1: Discover artists
+            # Step 1: Discover artists via Spotify
             with st.status("Step 1 — Finding emerging electronic artists via Spotify...", expanded=False) as s:
                 candidates = discover_emerging_artists(token, max_popularity=max_popularity, target=candidate_pool)
                 s.update(label=f"Step 1 complete — {len(candidates)} artists found (popularity ≤ {max_popularity}).", state="complete")
@@ -260,36 +278,46 @@ with tab_run:
                 st.error("No artists found. Try raising the max popularity score.")
                 st.stop()
 
-            # Step 2: Per-city routing + debut check
-            st.subheader("📍 Live Results by City")
-            bit_cache: dict = {}
+            all_names = [a["name"] for a in candidates]
+            all_hubs = {h for city in TARGET_TOWNS for h in CITY_HUBS.get(city, [])}
+
+            # Step 2: Batch-fetch upcoming shows for all candidates
+            st.subheader("Step 2 — Checking upcoming tour dates")
+            upcoming_map = prefetch_show_cities(all_names, "upcoming", "Fetching upcoming shows")
+            st.success(f"Upcoming tour dates fetched for {len(candidates)} artists.")
+
+            # Step 3: Only artists routing near a selected hub city need a past-shows check
+            routing_names = [
+                a["name"] for a in candidates
+                if any(h in upcoming_map.get(a["name"], set()) for h in all_hubs)
+            ]
+            st.caption(f"{len(routing_names)} artists routing near your selected markets — checking debut history...")
+
+            # Step 4: Batch-fetch past shows only for routing artists (saves Apify credits)
+            past_map: dict[str, set[str]] = {}
+            if routing_names:
+                st.subheader("Step 3 — Verifying debut history")
+                past_map = prefetch_show_cities(routing_names, "past", "Checking past shows")
+                st.success(f"Debut history verified for {len(routing_names)} routing artists.")
+
+            # Step 5: Per-city analysis — pure dict lookups, no more API calls
+            st.subheader("📍 Results by City")
             all_results: list[dict] = []
             city_slots = {city: st.empty() for city in sorted(TARGET_TOWNS.keys())}
-            progress = st.progress(0, text="Starting...")
-            total = len(TARGET_TOWNS) * len(candidates)
 
-            for c_idx, city in enumerate(sorted(TARGET_TOWNS.keys())):
+            for city in sorted(TARGET_TOWNS.keys()):
                 state = TARGET_TOWNS[city]
                 states = state if isinstance(state, list) else [state]
                 state_str = "/".join(states)
                 hubs = CITY_HUBS.get(city, [])
                 city_results = []
 
-                for a_idx, artist in enumerate(candidates):
-                    pct = int(((c_idx * len(candidates) + a_idx) / total) * 100)
-                    progress.progress(pct, text=f"{city} — {artist['name']} ({a_idx+1}/{len(candidates)})")
-
-                    # Gate 1: artist must have upcoming shows in a hub near this city
-                    upcoming = get_show_cities(artist["name"], "upcoming", bit_cache)
-                    routing_hubs = [h for h in hubs if h in upcoming]
+                for artist in candidates:
+                    routing_hubs = [h for h in hubs if h in upcoming_map.get(artist["name"], set())]
                     if not routing_hubs:
                         continue
-
-                    # Gate 2: artist must never have played the college town itself
-                    past = get_show_cities(artist["name"], "past", bit_cache)
-                    if city in past:
+                    if city in past_map.get(artist["name"], set()):
                         continue
-
                     for s in states:
                         city_results.append({
                             "Artist": artist["name"],
@@ -311,8 +339,6 @@ with tab_run:
                         st.dataframe(df_city.sort_values("Popularity Score"), use_container_width=True, hide_index=True)
                     else:
                         st.caption(f"📍 {city}, {state_str} — no opportunities found")
-
-            progress.progress(100, text="Complete.")
 
             if all_results:
                 save_results(all_results, {
