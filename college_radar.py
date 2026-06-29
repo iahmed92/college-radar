@@ -1,15 +1,17 @@
 from apify_client import ApifyClient
 from datetime import datetime
 from pathlib import Path
+import base64
 import json
 import pandas as pd
 import requests
 import streamlit as st
 
 APIFY_TOKEN = st.secrets["APIFY_TOKEN"]
-client = ApifyClient(APIFY_TOKEN)
-LASTFM_API_KEY = st.secrets["LASTFM_API_KEY"]
+SPOTIFY_CLIENT_ID = st.secrets["SPOTIFY_CLIENT_ID"]
+SPOTIFY_CLIENT_SECRET = st.secrets["SPOTIFY_CLIENT_SECRET"]
 
+client = ApifyClient(APIFY_TOKEN)
 RESULTS_FILE = Path.home() / ".college_radar_results.json"
 
 ALL_TARGET_TOWNS: dict[str, str | list[str]] = {
@@ -20,26 +22,152 @@ ALL_TARGET_TOWNS: dict[str, str | list[str]] = {
     "Kalamazoo": "MI", "Muncie": "IN", "Ames": "IA",
 }
 
-UNDERGROUND_TAGS = [
-    "uk bass", "future bass", "melodic techno", "afro house", "organic house",
-    "leftfield", "footwork", "bass music", "lo-fi house", "wave",
-    "dark clubbing", "speed garage", "gqom", "amapiano", "balearic",
-    "new rave", "electroclash", "dancefloor", "nu-disco underground",
+# Major routing hubs within driving distance of each college town.
+# Artists playing these cities are already in the region — prime debut targets.
+CITY_HUBS: dict[str, list[str]] = {
+    "Madison":        ["Chicago", "Milwaukee", "Minneapolis"],
+    "Bloomington":    ["Indianapolis", "Chicago"],
+    "East Lansing":   ["Detroit", "Chicago", "Grand Rapids"],
+    "Champaign":      ["Chicago", "St. Louis", "Indianapolis"],
+    "Iowa City":      ["Chicago", "Des Moines", "Minneapolis"],
+    "Lawrence":       ["Kansas City"],
+    "Columbia":       ["St. Louis", "Kansas City"],
+    "Manhattan":      ["Kansas City", "Wichita"],
+    "Lincoln":        ["Omaha", "Kansas City"],
+    "Fayetteville":   ["Kansas City", "Little Rock", "Tulsa"],
+    "Lexington":      ["Cincinnati", "Louisville", "Nashville"],
+    "Tuscaloosa":     ["Birmingham", "Nashville", "Atlanta"],
+    "Minneapolis":    ["Chicago", "Milwaukee"],
+    "Athens":         ["Columbus", "Pittsburgh", "Cleveland"],
+    "Oxford":         ["Columbus", "Cleveland", "Detroit"],
+    "West Lafayette": ["Indianapolis", "Chicago"],
+    "Kalamazoo":      ["Detroit", "Chicago", "Grand Rapids"],
+    "Muncie":         ["Indianapolis", "Cincinnati"],
+    "Ames":           ["Des Moines", "Minneapolis", "Chicago"],
+}
+
+# Spotify genre seed batches for the recommendations endpoint
+GENRE_SEED_BATCHES = [
+    ["electronic", "house", "techno"],
+    ["dance", "edm", "deep-house"],
+    ["drum-and-bass", "dubstep", "ambient"],
+    ["minimal-techno", "chicago-house", "uk-garage"],
+    ["downtempo", "trip-hop", "electronica"],
 ]
 
-ELECTRONIC_GENRE_KEYWORDS = {
-    "electronic", "dance", "house", "techno", "drum and bass", "bass",
-    "edm", "electronica", "jungle", "garage", "trance", "ambient",
-    "downtempo", "breakbeat", "dubstep", "future bass", "uk bass",
-    "afro house", "amapiano", "gqom", "lo-fi", "wave", "rave",
-}
+
+# ── SPOTIFY ───────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def get_spotify_token() -> str:
+    creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    r = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
+        data={"grant_type": "client_credentials"},
+        timeout=10,
+    )
+    return r.json().get("access_token", "")
+
+
+def batch_fetch_artists(artist_ids: list[str], token: str) -> list[dict]:
+    artists = []
+    headers = {"Authorization": f"Bearer {token}"}
+    for i in range(0, len(artist_ids), 50):
+        r = requests.get(
+            "https://api.spotify.com/v1/artists",
+            headers=headers,
+            params={"ids": ",".join(artist_ids[i:i+50])},
+            timeout=10,
+        )
+        artists.extend(a for a in r.json().get("artists", []) if a)
+    return artists
+
+
+def discover_emerging_artists(token: str, max_popularity: int, target: int) -> list[dict]:
+    """
+    Query Spotify's recommendations endpoint across multiple electronic genre seeds.
+    Returns artists filtered to max_popularity — genuinely underground acts.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    seen_ids: set[str] = set()
+    artist_ids: list[str] = []
+    status = st.sidebar.empty()
+
+    for seeds in GENRE_SEED_BATCHES:
+        if len(artist_ids) >= target * 3:
+            break
+        try:
+            status.caption(f"Querying Spotify: {', '.join(seeds)}...")
+            r = requests.get(
+                "https://api.spotify.com/v1/recommendations",
+                headers=headers,
+                params={
+                    "seed_genres": ",".join(seeds),
+                    "limit": 100,
+                    "max_popularity": max_popularity,
+                    "market": "US",
+                },
+                timeout=10,
+            )
+            for track in r.json().get("tracks", []):
+                for a in track.get("artists", []):
+                    if a.get("id") and a["id"] not in seen_ids:
+                        seen_ids.add(a["id"])
+                        artist_ids.append(a["id"])
+        except Exception as e:
+            st.warning(f"Spotify error ({seeds}): {e}")
+
+    status.empty()
+
+    # Batch-fetch full artist details and apply popularity + follower filters
+    raw = batch_fetch_artists(artist_ids, token)
+    seen_names: set[str] = set()
+    result = []
+    for a in raw:
+        if a["name"] in seen_names:
+            continue
+        if a.get("popularity", 100) > max_popularity:
+            continue
+        if a.get("followers", {}).get("total", 0) < 500:
+            continue
+        seen_names.add(a["name"])
+        result.append({
+            "name": a["name"],
+            "popularity": a["popularity"],
+            "followers": a["followers"]["total"],
+            "genres": ", ".join(a.get("genres", [])) or "—",
+            "spotify_id": a["id"],
+        })
+        if len(result) >= target:
+            break
+
+    return result
+
+
+# ── BANDSINTOWN ───────────────────────────────────────────────────────────────
+
+def get_show_cities(artist_name: str, date_filter: str, cache: dict) -> set[str]:
+    """Return set of cities where artist has shows. Cached per artist + date_filter."""
+    key = f"{artist_name}::{date_filter}"
+    if key not in cache:
+        try:
+            run = client.actor("solidcode/bandsintown-scraper").call(
+                run_input={"artists": [artist_name], "queryType": "events", "dateFilter": date_filter}
+            )
+            cache[key] = {
+                event.get("venue", {}).get("city", "")
+                for event in client.dataset(run.default_dataset_id).iterate_items()
+            }
+        except Exception:
+            cache[key] = set()
+    return cache[key]
 
 
 # ── PERSISTENCE ───────────────────────────────────────────────────────────────
 
-def save_results(results: list[dict], metadata: dict) -> None:
-    data = {"metadata": metadata, "results": results}
-    RESULTS_FILE.write_text(json.dumps(data, indent=2))
+def save_results(results: list[dict], meta: dict) -> None:
+    RESULTS_FILE.write_text(json.dumps({"metadata": meta, "results": results}, indent=2))
 
 
 def load_results() -> tuple[list[dict], dict]:
@@ -52,152 +180,47 @@ def load_results() -> tuple[list[dict], dict]:
         return [], {}
 
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-
-def lastfm_artist_info(name: str) -> tuple[int, bool]:
-    try:
-        r = requests.get("http://ws.audioscrobbler.com/2.0/", params={
-            "method": "artist.getInfo", "artist": name,
-            "api_key": LASTFM_API_KEY, "format": "json",
-        }, timeout=8)
-        data = r.json().get("artist", {})
-        listeners = int(data.get("stats", {}).get("listeners", 0))
-        top_tags = [t.get("name", "").lower() for t in data.get("tags", {}).get("tag", [])]
-        is_electronic = any(kw in tag for tag in top_tags for kw in ELECTRONIC_GENRE_KEYWORDS)
-        return listeners, is_electronic
-    except Exception:
-        return 0, False
-
-
-def pull_candidates(max_listeners: int, target: int) -> list[str]:
-    seen: set[str] = set()
-    artists: list[str] = []
-    status = st.sidebar.empty()
-    for tag in UNDERGROUND_TAGS:
-        if len(artists) >= target:
-            break
-        try:
-            r = requests.get("http://ws.audioscrobbler.com/2.0/", params={
-                "method": "tag.gettoptracks", "tag": tag,
-                "api_key": LASTFM_API_KEY, "format": "json", "limit": 50,
-            }, timeout=10)
-            r.raise_for_status()
-            for track in r.json().get("tracks", {}).get("track", []):
-                if len(artists) >= target:
-                    break
-                artist_obj = track.get("artist", {})
-                name = (artist_obj.get("name", "") if isinstance(artist_obj, dict) else str(artist_obj)).strip()
-                if not name or name in seen:
-                    continue
-                seen.add(name)
-                count, is_electronic = lastfm_artist_info(name)
-                if not is_electronic:
-                    status.caption(f"⛔ {name} — not electronic")
-                    continue
-                if count > max_listeners:
-                    status.caption(f"❌ {name} — too big ({count:,})")
-                    continue
-                status.caption(f"✅ {name} — {count:,} listeners")
-                artists.append(name)
-        except Exception:
-            pass
-    status.empty()
-    return artists
-
-
-def get_spotify_data(artist: str, cache: dict) -> dict:
-    if artist not in cache:
-        try:
-            run = client.actor("khadinakbar/spotify-artist-scraper").call(
-                run_input={"artistNames": [artist], "proxyCountry": "US"}
-            )
-            for item in client.dataset(run.default_dataset_id).iterate_items():
-                all_cities = item.get("topCities", [])
-                top_countries = [c.get("country", "").lower() for c in item.get("topCountries", [])]
-                us_in_countries = any(c in ("united states", "us", "usa") for c in top_countries)
-                us_cities_exist = any(
-                    c.get("country", "").lower() in ("united states", "us", "usa") for c in all_cities
-                )
-                cache[artist] = {
-                    "monthly_listeners": item.get("monthlyListeners", 0),
-                    "us_present": us_in_countries or us_cities_exist,
-                    "top_cities": {
-                        c.get("city", ""): c.get("listeners", 0)
-                        for c in all_cities
-                        if c.get("country", "").lower() in ("united states", "us", "usa")
-                    },
-                }
-        except Exception:
-            cache[artist] = {"monthly_listeners": 0, "us_present": False, "top_cities": {}}
-    return cache.get(artist, {})
-
-
-def has_debuted(artist: str, city: str, cache: dict) -> bool:
-    if artist not in cache:
-        try:
-            run = client.actor("solidcode/bandsintown-scraper").call(
-                run_input={"artists": [artist], "queryType": "events", "dateFilter": "past"}
-            )
-            past = set()
-            for event in client.dataset(run.default_dataset_id).iterate_items():
-                past.add(event.get("venue", {}).get("city", ""))
-            cache[artist] = past
-        except Exception:
-            cache[artist] = set()
-    return city in cache[artist]
-
-
 # ── PAGE ──────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="College Debut Radar", layout="wide", page_icon="🎓")
 st.title("🎓 College Town Debut Radar")
+st.caption("Emerging electronic artists routing near your college markets — verified never played there.")
 
 tab_dashboard, tab_run = st.tabs(["📊 Dashboard", "🔍 Run New Scan"])
 
 
-# ── TAB 1: DASHBOARD ──────────────────────────────────────────────────────────
+# ── DASHBOARD ─────────────────────────────────────────────────────────────────
 
 with tab_dashboard:
     saved_results, meta = load_results()
-
     if not saved_results:
         st.info("No data yet. Go to **Run New Scan** to generate your first report.")
     else:
-        last_run = meta.get("run_at", "unknown")
-        city_count = len(set(r["City"] for r in saved_results))
-        st.caption(f"Last updated: **{last_run}** · {len(saved_results)} debut opportunities across {city_count} cities")
-
         df_all = pd.DataFrame(saved_results)
-
-        # Summary metric row
-        cols = st.columns(4)
-        cols[0].metric("Total Opportunities", len(saved_results))
-        cols[1].metric("Cities with Matches", city_count)
-        cols[2].metric("Unique Artists", df_all["Artist"].nunique())
-        cols[3].metric("Artists Scanned", meta.get("candidates_scanned", "—"))
-
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Opportunities", len(saved_results))
+        c2.metric("Cities with Matches", df_all["City"].nunique())
+        c3.metric("Unique Artists", df_all["Artist"].nunique())
+        c4.metric("Artists Scanned", meta.get("candidates_scanned", "—"))
+        st.caption(f"Last updated: **{meta.get('run_at', 'unknown')}**")
         st.divider()
 
-        # City-by-city breakdown
         for city in sorted(df_all["City"].unique()):
             city_df = df_all[df_all["City"] == city].copy()
             state = "/".join(city_df["State"].unique())
-            city_df = city_df.drop(columns=["City", "State"]).sort_values("City Listeners", ascending=False)
-            city_df["City Listeners"] = city_df["City Listeners"].apply(lambda x: f"{int(x):,}")
-            city_df["Global Monthly Listeners"] = city_df["Global Monthly Listeners"].apply(lambda x: f"{int(x):,}")
-
-            with st.expander(f"📍 **{city}, {state}** — {len(city_df)} debut opportunit{'y' if len(city_df)==1 else 'ies'}", expanded=True):
-                st.dataframe(city_df, use_container_width=True, hide_index=True)
+            display = city_df.drop(columns=["City", "State"]).sort_values("Popularity Score")
+            display["Followers"] = display["Followers"].apply(lambda x: f"{int(x):,}")
+            with st.expander(f"📍 **{city}, {state}** — {len(city_df)} opportunit{'y' if len(city_df)==1 else 'ies'}", expanded=True):
+                st.dataframe(display, use_container_width=True, hide_index=True)
 
         st.divider()
-        csv = df_all.to_csv(index=False)
-        st.download_button("⬇ Download CSV", csv, "debut_radar_results.csv", "text/csv")
+        st.download_button("⬇ Download CSV", df_all.to_csv(index=False), "debut_radar_results.csv", "text/csv")
 
 
-# ── TAB 2: RUN NEW SCAN ───────────────────────────────────────────────────────
+# ── RUN NEW SCAN ──────────────────────────────────────────────────────────────
 
 with tab_run:
-    col_left, col_right = st.columns([1, 1])
+    col_left, col_right = st.columns(2)
 
     with col_left:
         st.subheader("📍 Target Markets")
@@ -205,17 +228,17 @@ with tab_run:
             f"{city}, {'/'.join(state) if isinstance(state, list) else state}"
             for city, state in ALL_TARGET_TOWNS.items()
         ]
-
-        btn_col1, btn_col2 = st.columns([1, 1])
-        if btn_col1.button("Select All", use_container_width=True):
+        b1, b2 = st.columns(2)
+        if b1.button("Select All", use_container_width=True):
             st.session_state["selected_cities"] = city_labels
-        if btn_col2.button("Clear All", use_container_width=True):
+        if b2.button("Clear All", use_container_width=True):
             st.session_state["selected_cities"] = []
 
-        default_cities = st.session_state.get("selected_cities", [])
-        selected_labels = st.pills("Select markets:", city_labels, selection_mode="multi", default=default_cities)
-
-        TARGET_TOWNS: dict[str, str | list[str]] = {
+        selected_labels = st.pills(
+            "Select markets:", city_labels, selection_mode="multi",
+            default=st.session_state.get("selected_cities", [])
+        )
+        TARGET_TOWNS = {
             city: state for city, state in ALL_TARGET_TOWNS.items()
             if any(lbl.startswith(city + ",") for lbl in (selected_labels or []))
         }
@@ -223,96 +246,97 @@ with tab_run:
 
     with col_right:
         st.subheader("⚙️ Settings")
-        candidate_pool = st.slider("Candidate pool size", 20, 200, 100, step=10,
-            help="Artists to pull from underground tags. Larger = better coverage but slower.")
-        max_lastfm = st.select_slider("Max artist size (Last.fm listeners)",
-            options=[10_000, 25_000, 50_000, 100_000, 250_000, 500_000],
-            value=100_000, format_func=lambda x: f"{x:,}",
-            help="Cuts artists above this size. Lower = more underground.")
-        min_city_listeners = int(st.number_input("Min Spotify listeners per city",
-            value=5_000, step=1_000, format="%d") or 5_000)
-        global_floor = int(st.number_input("Min global Spotify listeners",
-            value=10_000, step=5_000, format="%d") or 10_000)
+        candidate_pool = st.slider("Artist pool size", 20, 200, 100, step=10,
+            help="How many artists to pull from Spotify's recommendations engine.")
+        max_popularity = st.slider("Max Spotify popularity score", 10, 60, 40, step=5,
+            help="0–100. Artists below this are emerging/underground. 40 = solidly underground, 60 = rising indie.")
+        st.caption(
+            f"**Popularity ≤ {max_popularity}** — underground to emerging.  \n"
+            "**Hub city logic** — flags artists with upcoming shows near each college town who have never played there."
+        )
 
     st.divider()
 
     if not TARGET_TOWNS:
         st.warning("Select at least one market to continue.")
     else:
-        run_clicked = st.button("▶ Run Full Analysis", type="primary", use_container_width=True)
+        run_clicked = st.button("▶ Run Analysis", type="primary", use_container_width=True)
 
         if run_clicked:
-            # Step 1: Candidate pool
-            with st.status("Step 1 — Building electronic artist candidate pool...", expanded=False) as s:
-                candidates = pull_candidates(max_listeners=max_lastfm, target=candidate_pool)
-                s.update(label=f"Step 1 complete — {len(candidates)} electronic artists found.", state="complete")
-
-            if not candidates:
-                st.error("No candidates found. Try raising the max artist size.")
+            token = get_spotify_token()
+            if not token:
+                st.error("Spotify authentication failed — check SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in secrets.")
                 st.stop()
 
-            # Step 2: Per-city analysis
-            st.subheader("Live Results")
-            spotify_cache: dict = {}
-            bandsintown_cache: dict = {}
+            # Step 1: Discover artists
+            with st.status("Step 1 — Finding emerging electronic artists via Spotify...", expanded=False) as s:
+                candidates = discover_emerging_artists(token, max_popularity=max_popularity, target=candidate_pool)
+                s.update(label=f"Step 1 complete — {len(candidates)} artists found (popularity ≤ {max_popularity}).", state="complete")
+
+            if not candidates:
+                st.error("No artists found. Try raising the max popularity score.")
+                st.stop()
+
+            # Step 2: Per-city routing + debut check
+            st.subheader("📍 Live Results by City")
+            bit_cache: dict = {}
             all_results: list[dict] = []
-            city_placeholders = {city: st.empty() for city in sorted(TARGET_TOWNS.keys())}
+            city_slots = {city: st.empty() for city in sorted(TARGET_TOWNS.keys())}
             progress = st.progress(0, text="Starting...")
+            total = len(TARGET_TOWNS) * len(candidates)
 
             for c_idx, city in enumerate(sorted(TARGET_TOWNS.keys())):
                 state = TARGET_TOWNS[city]
                 states = state if isinstance(state, list) else [state]
                 state_str = "/".join(states)
+                hubs = CITY_HUBS.get(city, [])
                 city_results = []
 
                 for a_idx, artist in enumerate(candidates):
-                    pct = int(((c_idx * len(candidates) + a_idx) / (len(TARGET_TOWNS) * len(candidates))) * 100)
-                    progress.progress(pct, text=f"{city}, {state_str} — {artist} ({a_idx+1}/{len(candidates)})")
+                    pct = int(((c_idx * len(candidates) + a_idx) / total) * 100)
+                    progress.progress(pct, text=f"{city} — {artist['name']} ({a_idx+1}/{len(candidates)})")
 
-                    spotify = get_spotify_data(artist, spotify_cache)
-                    if not spotify.get("us_present", False):
+                    # Gate 1: artist must have upcoming shows in a hub near this city
+                    upcoming = get_show_cities(artist["name"], "upcoming", bit_cache)
+                    routing_hubs = [h for h in hubs if h in upcoming]
+                    if not routing_hubs:
                         continue
-                    if spotify.get("monthly_listeners", 0) < global_floor:
-                        continue
-                    city_listeners = spotify.get("top_cities", {}).get(city, 0)
-                    if city_listeners < min_city_listeners:
-                        continue
-                    if has_debuted(artist, city, bandsintown_cache):
+
+                    # Gate 2: artist must never have played the college town itself
+                    past = get_show_cities(artist["name"], "past", bit_cache)
+                    if city in past:
                         continue
 
                     for s in states:
-                        row = {
-                            "Artist": artist,
+                        city_results.append({
+                            "Artist": artist["name"],
                             "City": city,
                             "State": s,
-                            "City Listeners": city_listeners,
-                            "Global Monthly Listeners": spotify["monthly_listeners"],
-                        }
-                        city_results.append(row)
-                        all_results.append(row)
+                            "Routing Through": ", ".join(routing_hubs),
+                            "Popularity Score": artist["popularity"],
+                            "Followers": artist["followers"],
+                            "Genres": artist["genres"],
+                        })
 
-                # Update city placeholder live
-                with city_placeholders[city].container():
+                all_results.extend(city_results)
+
+                with city_slots[city].container():
                     if city_results:
                         df_city = pd.DataFrame(city_results).drop(columns=["City", "State"])
-                        df_city = df_city.sort_values("City Listeners", ascending=False)
-                        df_city["City Listeners"] = df_city["City Listeners"].apply(lambda x: f"{int(x):,}")
-                        df_city["Global Monthly Listeners"] = df_city["Global Monthly Listeners"].apply(lambda x: f"{int(x):,}")
-                        st.markdown(f"**📍 {city}, {state_str}** — {len(city_results)} opportunit{'y' if len(city_results)==1 else 'ies'}")
-                        st.dataframe(df_city, use_container_width=True, hide_index=True)
+                        df_city["Followers"] = df_city["Followers"].apply(lambda x: f"{x:,}")
+                        st.markdown(f"**📍 {city}, {state_str}** — {len(city_results)} debut opportunit{'y' if len(city_results)==1 else 'ies'}")
+                        st.dataframe(df_city.sort_values("Popularity Score"), use_container_width=True, hide_index=True)
                     else:
                         st.caption(f"📍 {city}, {state_str} — no opportunities found")
 
-            progress.progress(100, text="Done.")
+            progress.progress(100, text="Complete.")
 
-            # Save results
             if all_results:
-                metadata = {
+                save_results(all_results, {
                     "run_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "candidates_scanned": len(candidates),
                     "cities_scanned": len(TARGET_TOWNS),
-                }
-                save_results(all_results, metadata)
+                })
                 st.success(f"✅ {len(all_results)} debut opportunities saved. Switch to **Dashboard** to view.")
             else:
-                st.info("No opportunities found. Try lowering the city listener threshold or expanding the pool.")
+                st.info("No opportunities found. Try raising the popularity score or expanding the artist pool.")
