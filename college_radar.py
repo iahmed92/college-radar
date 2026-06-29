@@ -46,14 +46,20 @@ CITY_HUBS: dict[str, list[str]] = {
     "Ames":           ["Des Moines", "Minneapolis", "Chicago"],
 }
 
-# Spotify genre seed batches for the recommendations endpoint
-GENRE_SEED_BATCHES = [
-    ["electronic", "house", "techno"],
-    ["dance", "edm", "deep-house"],
-    ["drum-and-bass", "dubstep", "ambient"],
-    ["minimal-techno", "chicago-house", "uk-garage"],
-    ["downtempo", "trip-hop", "electronica"],
+# Underground/scene search terms — Spotify's /recommendations and genre: search
+# filter are both deprecated, so discovery runs through plain-text search instead.
+UNDERGROUND_SEARCH_TERMS = [
+    "uk bass", "footwork", "gqom", "amapiano", "melodic techno", "organic house",
+    "afro house", "bass house", "uk garage", "minimal techno", "deep house",
+    "leftfield", "speed garage", "balearic", "new rave", "electroclash",
+    "dark clubbing", "lo-fi house", "wave", "downtempo", "trip hop",
 ]
+
+ELECTRONIC_GENRE_KEYWORDS = {
+    "house", "techno", "bass", "garage", "drum and bass", "jungle", "dubstep",
+    "edm", "electro", "electronica", "amapiano", "gqom", "afro", "downtempo",
+    "trip hop", "trance", "rave", "wave", "club", "balearic", "footwork",
+}
 
 
 # ── SPOTIFY ───────────────────────────────────────────────────────────────────
@@ -70,78 +76,55 @@ def get_spotify_token() -> str:
     return r.json().get("access_token", "")
 
 
-def batch_fetch_artists(artist_ids: list[str], token: str) -> list[dict]:
-    artists = []
-    headers = {"Authorization": f"Bearer {token}"}
-    for i in range(0, len(artist_ids), 50):
-        r = requests.get(
-            "https://api.spotify.com/v1/artists",
-            headers=headers,
-            params={"ids": ",".join(artist_ids[i:i+50])},
-            timeout=10,
-        )
-        artists.extend(a for a in r.json().get("artists", []) if a)
-    return artists
-
-
 def discover_emerging_artists(token: str, max_popularity: int, target: int) -> list[dict]:
     """
-    Query Spotify's recommendations endpoint across multiple electronic genre seeds.
-    Returns artists filtered to max_popularity — genuinely underground acts.
+    Spotify deprecated /recommendations and the genre: search filter for standard
+    apps in late 2024, so discovery runs through plain-text scene/genre search terms
+    instead, with results filtered down by real popularity + follower counts.
     """
     headers = {"Authorization": f"Bearer {token}"}
-    seen_ids: set[str] = set()
-    artist_ids: list[str] = []
-    status = st.sidebar.empty()
-
-    for seeds in GENRE_SEED_BATCHES:
-        if len(artist_ids) >= target * 3:
-            break
-        try:
-            status.caption(f"Querying Spotify: {', '.join(seeds)}...")
-            r = requests.get(
-                "https://api.spotify.com/v1/recommendations",
-                headers=headers,
-                params={
-                    "seed_genres": ",".join(seeds),
-                    "limit": 100,
-                    "max_popularity": max_popularity,
-                    "market": "US",
-                },
-                timeout=10,
-            )
-            for track in r.json().get("tracks", []):
-                for a in track.get("artists", []):
-                    if a.get("id") and a["id"] not in seen_ids:
-                        seen_ids.add(a["id"])
-                        artist_ids.append(a["id"])
-        except Exception as e:
-            st.warning(f"Spotify error ({seeds}): {e}")
-
-    status.empty()
-
-    # Batch-fetch full artist details and apply popularity + follower filters
-    raw = batch_fetch_artists(artist_ids, token)
     seen_names: set[str] = set()
     result = []
-    for a in raw:
-        if a["name"] in seen_names:
-            continue
-        if a.get("popularity", 100) > max_popularity:
-            continue
-        if a.get("followers", {}).get("total", 0) < 500:
-            continue
-        seen_names.add(a["name"])
-        result.append({
-            "name": a["name"],
-            "popularity": a["popularity"],
-            "followers": a["followers"]["total"],
-            "genres": ", ".join(a.get("genres", [])) or "—",
-            "spotify_id": a["id"],
-        })
+    status = st.sidebar.empty()
+
+    for term in UNDERGROUND_SEARCH_TERMS:
         if len(result) >= target:
             break
+        try:
+            status.caption(f"Searching Spotify: {term}...")
+            r = requests.get(
+                "https://api.spotify.com/v1/search",
+                headers=headers,
+                params={"q": term, "type": "artist", "limit": 50, "market": "US"},
+                timeout=10,
+            )
+            for a in r.json().get("artists", {}).get("items", []):
+                if a["name"] in seen_names:
+                    continue
+                if a.get("popularity", 100) > max_popularity:
+                    continue
+                if a.get("followers", {}).get("total", 0) < 500:
+                    continue
+                genres = a.get("genres", [])
+                is_electronic = any(
+                    kw in g.lower() for g in genres for kw in ELECTRONIC_GENRE_KEYWORDS
+                ) or not genres  # no genre data — let popularity ceiling do the filtering
+                if not is_electronic:
+                    continue
+                seen_names.add(a["name"])
+                result.append({
+                    "name": a["name"],
+                    "popularity": a["popularity"],
+                    "followers": a["followers"]["total"],
+                    "genres": ", ".join(genres) or "—",
+                    "spotify_id": a["id"],
+                })
+                if len(result) >= target:
+                    break
+        except Exception as e:
+            st.warning(f"Spotify error ({term}): {e}")
 
+    status.empty()
     return result
 
 
@@ -156,7 +139,7 @@ def get_show_cities(artist_name: str, date_filter: str, cache: dict) -> set[str]
                 run_input={"artists": [artist_name], "queryType": "events", "dateFilter": date_filter}
             )
             cache[key] = {
-                event.get("venue", {}).get("city", "")
+                event.get("venueCity", "")
                 for event in client.dataset(run.default_dataset_id).iterate_items()
             }
         except Exception:
