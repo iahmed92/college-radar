@@ -212,7 +212,7 @@ with tab_run:
         if btn_col2.button("Clear All", use_container_width=True):
             st.session_state["selected_cities"] = []
 
-        default_cities = st.session_state.get("selected_cities", city_labels)
+        default_cities = st.session_state.get("selected_cities", [])
         selected_labels = st.pills("Select markets:", city_labels, selection_mode="multi", default=default_cities)
 
         TARGET_TOWNS: dict[str, str | list[str]] = {
