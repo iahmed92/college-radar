@@ -1,0 +1,4 @@
+apify-client
+pandas
+requests
+streamlit
