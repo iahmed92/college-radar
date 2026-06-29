@@ -205,7 +205,16 @@ with tab_run:
             f"{city}, {'/'.join(state) if isinstance(state, list) else state}"
             for city, state in ALL_TARGET_TOWNS.items()
         ]
-        selected_labels = st.pills("Select markets:", city_labels, selection_mode="multi", default=city_labels)
+
+        btn_col1, btn_col2 = st.columns([1, 1])
+        if btn_col1.button("Select All", use_container_width=True):
+            st.session_state["selected_cities"] = city_labels
+        if btn_col2.button("Clear All", use_container_width=True):
+            st.session_state["selected_cities"] = []
+
+        default_cities = st.session_state.get("selected_cities", city_labels)
+        selected_labels = st.pills("Select markets:", city_labels, selection_mode="multi", default=default_cities)
+
         TARGET_TOWNS: dict[str, str | list[str]] = {
             city: state for city, state in ALL_TARGET_TOWNS.items()
             if any(lbl.startswith(city + ",") for lbl in (selected_labels or []))
